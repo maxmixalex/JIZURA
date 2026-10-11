@@ -1,0 +1,72 @@
+name: Native CLI (Windows / Linux)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'go.mod'
+      - 'jizura-*.go'
+      - 'tools/cli/**'
+      - 'zh-hans/index.html'
+      - '.github/workflows/native-cli.yml'
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: linux-x64
+            executable: jizura-render
+          - os: windows-2022
+            target: windows-x64
+            executable: jizura-render.exe
+    runs-on: ${{ matrix.os }}
+    env:
+      PLAYWRIGHT_BROWSERS_PATH: ${{ github.workspace }}/.browsers
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Compile native Go CLI
+        shell: bash
+        run: |
+          go test ./...
+          mkdir -p build
+          go build -trimpath -ldflags='-s -w' -o 'build/${{ matrix.executable }}' .
+      - name: Download packaging runtimes (Chromium / FFmpeg)
+        shell: bash
+        run: |
+          npm install --no-save --no-package-lock --ignore-scripts=false playwright@1.57.0 ffmpeg-static@5.2.0
+          npx playwright install chromium-headless-shell
+      - name: Assemble offline distribution
+        shell: bash
+        run: |
+          python tools/cli/package.py \
+            --executable 'build/${{ matrix.executable }}' \
+            --browser-cache "$PLAYWRIGHT_BROWSERS_PATH" \
+            --stage 'dist/jizura-render-${{ matrix.target }}' \
+            --archive 'dist/jizura-render-${{ matrix.target }}.zip'
+      - name: Smoke-test bundled executables and alpha video
+        shell: bash
+        run: |
+          cd 'dist/jizura-render-${{ matrix.target }}'
+          './${{ matrix.executable }}' --text 'JIZURA CLI TEST' --duration 0.3 --res 360 \
+            --format qtrle --output smoke.mov
+          python -c 'import os; assert os.path.getsize("smoke.mov") > 4096'
+          rm -f smoke.mov
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jizura-render-${{ matrix.target }}
+          path: dist/jizura-render-${{ matrix.target }}.zip
+          if-no-files-found: error
+          retention-days: 14
