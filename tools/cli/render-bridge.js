@@ -22,7 +22,80 @@ async function __jizuraInit(opts) {
     project.timing.lineScale = 0.85;
   }
   if (!project.lyrics || !String(project.lyrics).trim()) throw new Error('Lyrics are empty');
-  const plan = J.plan(project, null);
+  // The native frontend accepts directly supplied font files or installed OS font families.
+  // It registers new faces under JIZURA's user-font catalogue and assigns the same
+  // three roles used by the browser editor, without modifying upstream definitions.
+  if (Array.isArray(project.userFonts)) for (const uf of project.userFonts) {
+    if (uf && uf.key && uf.family && !J.FONTS[uf.key]) J.addUserFont(uf.key, uf.label || uf.family, uf.family, uf.weight || 400);
+  }
+  project.fonts = Object.assign({}, project.fonts || {});
+  for (const [role, spec] of Object.entries(opts.fontFiles || {})) {
+    if (!['display', 'serif', 'body'].includes(role)) throw new Error(`Unknown font role ${role}`);
+    const key = `user_cli_${role}`;
+    let family = spec.name;
+    if (spec.base64) {
+      family = `JIZURA_CLI_${role}`;
+      const raw = atob(spec.base64), bytes = new Uint8Array(raw.length);
+      for (let k = 0; k < raw.length; k++) bytes[k] = raw.charCodeAt(k);
+      const face = new FontFace(family, bytes.buffer);
+      await face.load(); document.fonts.add(face);
+    }
+    if (!family) throw new Error(`Font for role ${role} is empty`);
+    const label = spec.filename || family;
+    J.addUserFont(key, label, family, 400);
+    if (spec.base64) J.FONTS[key].loaded = true;
+    project.fonts[role] = key;
+    project.userFonts = (project.userFonts || []).filter(x => x.key !== key)
+      .concat([{ key, label, family, weight:400, source: spec.base64 ? 'file' : 'family' }]);
+  }
+  let plan = J.plan(project, null);
+  // Per-cut manual technique choices use the EXACT same project.overrides[*].cutTech
+  // format as the browser's "手法" picker; the first plan tells us how many cuts
+  // exist, and a second plan applies the selections deterministically.
+  if (opts.techniques && Object.keys(opts.techniques).length) {
+    for (const [group, key] of Object.entries(opts.techniques)) {
+      const def = J.registry(group) && J.registry(group)[key];
+      if (key !== 'none' || !['decor', 'trans', 'fx'].includes(group)) {
+        if (!def || def.special) throw new Error(`Unknown hand technique ${group}=${key}; see --list-techniques`);
+      }
+    }
+    const {fx:forcedFx, ...cutTechniques} = opts.techniques;
+    if (forcedFx) project.cliForcedFX = forcedFx;
+    if (Object.keys(cutTechniques).length) {
+      project.overrides = Object.assign({}, project.overrides || {});
+      const indexes = new Map();
+      for (const cut of plan.cuts) {
+        if (cut.line < 0 || !J.LAYOUTS[cut.layout] || J.LAYOUTS[cut.layout].special) continue;
+        const k = indexes.get(cut.line) || 0; indexes.set(cut.line, k + 1);
+        const li = cut.line;
+        const ov = Object.assign({}, project.overrides[li] || {});
+        const slots = Object.assign({}, ov.cutTech || {});
+        slots[k] = Object.assign({}, slots[k] || {}, cutTechniques);
+        ov.cutTech = slots; project.overrides[li] = ov;
+      }
+      plan = J.plan(project, null);
+    }
+  }
+  if (project.cliForcedFX) {
+    const key = project.cliForcedFX;
+    if (key !== 'none' && (!J.FXE[key] || J.FXE[key].special))
+      throw new Error(`Unknown screen effect fx=${key}; see --list-techniques --tech-group fx`);
+    // Screen effects are timed events, not cutTech picks in upstream. Preserve
+    // their native implementation and apply one event per cut when requested.
+    plan.events = key === 'none' ? [] : plan.cuts.filter(c => c.line >= 0 && !c.interlude).map(c => {
+      const D = J.FXE[key];
+      return { t: Math.max(0, c.start - (D.pre || 0) / 24), type:key,
+        amp: D.amp || 1, dur: (D.dur || 3) / 24 };
+    });
+  }
+  // Saved JSON records uploaded font metadata, but does not contain font binaries.
+  // Fail clearly rather than silently replacing a customized typeface.
+  const usedFonts = new Set(J.fontsOfPlan(plan));
+  for (const uf of project.userFonts || []) {
+    if (!usedFonts.has(uf.key)) continue;
+    if ((uf.source === 'file' || uf.key.startsWith('user_UF_') || (uf.key.startsWith('user_cli_') && uf.source !== 'family')) && !J.FONTS[uf.key]?.loaded)
+      throw new Error(`Project font file ${uf.label || uf.key} is missing; pass --font/--font-display/--font-serif/--font-body`);
+  }
   if (!plan || !plan.cuts || !plan.cuts.length) throw new Error('No drawable cuts');
   if (!Number.isFinite(plan.duration) || plan.duration <= 0) throw new Error('Invalid plan duration');
   const [dw, dh] = J.outputSize(project);

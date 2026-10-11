@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -28,10 +29,26 @@ var assets embed.FS
 
 const timeout = 30 * time.Minute
 
+type repeatable []string
+
+func (r *repeatable) Set(value string) error { *r = append(*r, value); return nil }
+func (r *repeatable) String() string         { return strings.Join(*r, ", ") }
+
+type fontSpec struct {
+	Name     string `json:"name,omitempty"`
+	Base64   string `json:"base64,omitempty"`
+	Filename string `json:"filename,omitempty"`
+}
+
 type options struct {
 	lyrics, lyricsFile, projectFile, output, format, style, title, aspect, lang string
 	seed                                                                        int64
-	fps, res, width, height                                                     int
+	res, width, height                                                          int
+	fps                                                                         float64
+	font, fontDisplay, fontSerif, fontBody                                      string
+	tech                                                                        repeatable
+	listTechniques                                                              bool
+	techGroup                                                                   string
 	duration, start                                                             float64
 	alpha, noHUD, overwrite, writeProject                                       bool
 	browser, ffmpeg                                                             string
@@ -49,7 +66,14 @@ func parseFlags() (options, error) {
 	flag.StringVar(&o.aspect, "aspect", "", "16:9, 9:16, 1:1, 4:3, 3:4, 4:5, 21:9")
 	flag.StringVar(&o.lang, "lang", "", "auto | ja | en | zh-Hans | zh-Hant | ko")
 	flag.Int64Var(&o.seed, "seed", -1, "Fixed style random seed (-1 preserves project/default).")
-	flag.IntVar(&o.fps, "fps", 0, "24, 30 or 60. Zero uses the project's FPS.")
+	flag.Float64Var(&o.fps, "fps", 0, "Output frames/second (e.g. 23.976, 24, 25, 30, 50, 59.94, 60). Zero uses project's FPS.")
+	flag.StringVar(&o.font, "font", "", "Font filename (.ttf/.otf/.woff/.woff2) or installed font family; force display, serif and body.")
+	flag.StringVar(&o.fontDisplay, "font-display", "", "Override display typeface (font file or installed font family).")
+	flag.StringVar(&o.fontSerif, "font-serif", "", "Override serif typeface (font file or installed font family).")
+	flag.StringVar(&o.fontBody, "font-body", "", "Override body typeface (font file or installed font family).")
+	flag.Var(&o.tech, "tech", "Override a JIZURA technique, repeatable, e.g. layout=center, enter=type, treat=none.")
+	flag.BoolVar(&o.listTechniques, "list-techniques", false, "List available hand techniques and their IDs without rendering a clip.")
+	flag.StringVar(&o.techGroup, "tech-group", "", "Optional group for --list-techniques (layout/enter/hold/exit/decor/treat/bg/cam/trans/fx).")
 	flag.IntVar(&o.res, "res", 0, "Output short-edge resolution (e.g. 720, 1080).")
 	flag.IntVar(&o.width, "width", 0, "Override width in pixels; specify height too.")
 	flag.IntVar(&o.height, "height", 0, "Override height in pixels; specify width too.")
@@ -68,6 +92,8 @@ Examples:
   jizura-render --text "一瞬だけ" --duration 2 --seed 42 --format qtrle --output title.mov
   jizura-render --text "KINETIC TYPE" --alpha --format png --output ./frames
   jizura-render --project scene.jizura.json --format prores4444 --output clip.mov
+  jizura-render --list-techniques --tech-group enter
+  jizura-render --text "鬼" --tech layout=center --tech enter=type --font custom.otf --fps 25 --format qtrle --output oni.mov
 
 No browser UI is opened. Release packages include Chromium and FFmpeg.
 
@@ -75,6 +101,21 @@ Options:`)
 		flag.PrintDefaults()
 	}
 	flag.Parse()
+	if o.techGroup != "" && !validTechniqueGroup(o.techGroup, true) {
+		return o, fmt.Errorf("unsupported technique group %q", o.techGroup)
+	}
+	if o.techGroup != "" && !o.listTechniques {
+		return o, errors.New("--tech-group requires --list-techniques")
+	}
+	for _, t := range o.tech {
+		parts := strings.SplitN(t, "=", 2)
+		if len(parts) != 2 || !validTechniqueGroup(parts[0], true) || parts[1] == "" {
+			return o, fmt.Errorf("invalid --tech %q (use group=key, see --list-techniques)", t)
+		}
+	}
+	if o.listTechniques {
+		return o, nil
+	}
 	if o.lyrics != "" {
 		o.lyrics = strings.ReplaceAll(o.lyrics, `\n`, "\n")
 	}
@@ -93,9 +134,10 @@ Options:`)
 	if o.duration < 0 || o.start < 0 {
 		return o, errors.New("--duration and --start must be nonnegative")
 	}
-	if o.fps != 0 && o.fps != 24 && o.fps != 30 && o.fps != 60 {
-		return o, errors.New("--fps must be 24, 30 or 60")
+	if math.IsNaN(o.fps) || math.IsInf(o.fps, 0) || (o.fps != 0 && (o.fps < 1 || o.fps > 120)) {
+		return o, errors.New("--fps must be between 1 and 120 (or 0 for the project default)")
 	}
+	o.fps = normalizedFPS(o.fps)
 	if (o.width == 0) != (o.height == 0) {
 		return o, errors.New("--width and --height must be specified together")
 	}
@@ -166,25 +208,89 @@ Options:`)
 	return o, nil
 }
 
+func validTechniqueGroup(g string, includeFX bool) bool {
+	switch g {
+	case "layout", "enter", "hold", "exit", "decor", "treat", "bg", "cam", "trans":
+		return true
+	case "fx":
+		return includeFX
+	default:
+		return false
+	}
+}
+func normalizedFPS(f float64) float64 {
+	for _, pair := range [][2]float64{{23.976, 24000.0 / 1001}, {29.97, 30000.0 / 1001}, {59.94, 60000.0 / 1001}, {119.88, 120000.0 / 1001}} {
+		if math.Abs(f-pair[0]) < 0.0001 {
+			return pair[1]
+		}
+	}
+	return f
+}
+func fpsString(f float64) string {
+	for _, pair := range []struct {
+		rate     float64
+		fraction string
+	}{
+		{24000.0 / 1001, "24000/1001"}, {30000.0 / 1001, "30000/1001"},
+		{60000.0 / 1001, "60000/1001"}, {120000.0 / 1001, "120000/1001"},
+	} {
+		if math.Abs(f-pair.rate) < 0.00001 {
+			return pair.fraction
+		}
+	}
+	return strconv.FormatFloat(f, 'f', -1, 64)
+}
+func resolveFontChoice(choice string) (fontSpec, error) {
+	if choice == "" {
+		return fontSpec{}, nil
+	}
+	if f, err := os.Stat(choice); err == nil {
+		if f.IsDir() {
+			return fontSpec{}, fmt.Errorf("font %q is a directory", choice)
+		}
+		if f.Size() > 40<<20 {
+			return fontSpec{}, fmt.Errorf("font %q exceeds 40 MB", choice)
+		}
+		if f.Size() == 0 {
+			return fontSpec{}, fmt.Errorf("font %q is empty", choice)
+		}
+		b, err := os.ReadFile(choice)
+		if err != nil {
+			return fontSpec{}, err
+		}
+		return fontSpec{Filename: filepath.Base(choice), Base64: base64.StdEncoding.EncodeToString(b)}, nil
+	}
+	switch strings.ToLower(filepath.Ext(choice)) {
+	case ".ttf", ".otf", ".woff", ".woff2", ".ttc":
+		return fontSpec{}, fmt.Errorf("font file %q does not exist", choice)
+	}
+	if strings.ContainsAny(choice, `/\`) {
+		return fontSpec{}, fmt.Errorf("font path %q does not exist", choice)
+	}
+	return fontSpec{Name: choice}, nil
+}
+
 type jobConfig struct {
-	Project      json.RawMessage `json:"project"`
-	Lyrics       *string         `json:"lyrics"`
-	Style        *string         `json:"style"`
-	Title        *string         `json:"title"`
-	Aspect       *string         `json:"aspect"`
-	Lang         *string         `json:"lang"`
-	Seed         *int64          `json:"seed"`
-	FPS          *int            `json:"fps"`
-	Res          *int            `json:"res"`
-	Width        int             `json:"width"`
-	Height       int             `json:"height"`
-	Start        float64         `json:"start"`
-	Duration     float64         `json:"duration"`
-	Alpha        bool            `json:"alpha"`
-	NoHUD        bool            `json:"noHud"`
-	StartAtZero  bool            `json:"startAtZero"`
-	WriteProject bool            `json:"writeProject"`
-	MaxFrames    int             `json:"maxFrames"`
+	Project      json.RawMessage     `json:"project"`
+	Lyrics       *string             `json:"lyrics"`
+	Style        *string             `json:"style"`
+	Title        *string             `json:"title"`
+	Aspect       *string             `json:"aspect"`
+	Lang         *string             `json:"lang"`
+	Seed         *int64              `json:"seed"`
+	FPS          *float64            `json:"fps"`
+	Res          *int                `json:"res"`
+	Width        int                 `json:"width"`
+	Height       int                 `json:"height"`
+	Start        float64             `json:"start"`
+	Duration     float64             `json:"duration"`
+	Alpha        bool                `json:"alpha"`
+	NoHUD        bool                `json:"noHud"`
+	StartAtZero  bool                `json:"startAtZero"`
+	WriteProject bool                `json:"writeProject"`
+	MaxFrames    int                 `json:"maxFrames"`
+	Techniques   map[string]string   `json:"techniques,omitempty"`
+	Fonts        map[string]fontSpec `json:"fontFiles,omitempty"`
 }
 
 func ptr[T any](v T) *T { return &v }
@@ -214,6 +320,36 @@ func configFor(o options) (jobConfig, error) {
 	}
 	if o.res != 0 {
 		c.Res = ptr(o.res)
+	}
+	if len(o.tech) > 0 {
+		c.Techniques = make(map[string]string)
+		for _, t := range o.tech {
+			pair := strings.SplitN(t, "=", 2)
+			c.Techniques[pair[0]] = pair[1]
+		}
+	}
+	fontInputs := map[string]string{"display": o.font, "serif": o.font, "body": o.font}
+	if o.fontDisplay != "" {
+		fontInputs["display"] = o.fontDisplay
+	}
+	if o.fontSerif != "" {
+		fontInputs["serif"] = o.fontSerif
+	}
+	if o.fontBody != "" {
+		fontInputs["body"] = o.fontBody
+	}
+	for role, val := range fontInputs {
+		if val == "" {
+			continue
+		}
+		spec, err := resolveFontChoice(val)
+		if err != nil {
+			return c, err
+		}
+		if c.Fonts == nil {
+			c.Fonts = make(map[string]fontSpec)
+		}
+		c.Fonts[role] = spec
 	}
 	if o.projectFile != "" {
 		b, err := os.ReadFile(o.projectFile)
@@ -276,7 +412,7 @@ type info struct {
 	Frames       int             `json:"frames"`
 	Width        int             `json:"width"`
 	Height       int             `json:"height"`
-	FPS          int             `json:"fps"`
+	FPS          float64         `json:"fps"`
 	Duration     float64         `json:"duration"`
 	PlanDuration float64         `json:"planDuration"`
 	Transparent  bool            `json:"transparent"`
@@ -292,7 +428,7 @@ type outputSink struct {
 }
 
 func (s *outputSink) start(meta info) error {
-	if meta.Frames <= 0 || meta.Frames > 60*60*15 || meta.Width < 16 || meta.Height < 16 || meta.Width > 8192 || meta.Height > 8192 || meta.FPS <= 0 {
+	if meta.Frames <= 0 || meta.Frames > 60*60*15 || meta.Width < 16 || meta.Height < 16 || meta.Width > 8192 || meta.Height > 8192 || meta.FPS <= 0 || meta.FPS > 120 || math.IsNaN(meta.FPS) || math.IsInf(meta.FPS, 0) {
 		return errors.New("invalid render dimensions/fps")
 	}
 	s.count = meta.Frames
@@ -320,7 +456,7 @@ func (s *outputSink) start(meta info) error {
 		s.encoder = cmd
 		s.stdin = stdin
 	}
-	log.Printf("Rendering %d frames at %dx%d, %d fps (%.2f s; plan %.2f s), format=%s alpha=%v", meta.Frames, meta.Width, meta.Height, meta.FPS, meta.Duration, meta.PlanDuration, s.opts.format, meta.Transparent)
+	log.Printf("Rendering %d frames at %dx%d, %s fps (%.2f s; plan %.2f s), format=%s alpha=%v", meta.Frames, meta.Width, meta.Height, fpsString(meta.FPS), meta.Duration, meta.PlanDuration, s.opts.format, meta.Transparent)
 	return nil
 }
 func (s *outputSink) writeFrame(i int, b []byte) error {
@@ -385,7 +521,7 @@ func (s *outputSink) abort() {
 	}
 }
 func ffmpegArgs(o options, m info) []string {
-	args := []string{"-hide_banner", "-nostdin", "-loglevel", "error", "-y", "-f", "image2pipe", "-framerate", strconv.Itoa(m.FPS), "-c:v", "png", "-i", "pipe:0", "-an"}
+	args := []string{"-hide_banner", "-nostdin", "-loglevel", "error", "-y", "-f", "image2pipe", "-framerate", fpsString(m.FPS), "-c:v", "png", "-i", "pipe:0", "-an"}
 	switch o.format {
 	case "mp4":
 		args = append(args, "-c:v", "libx264", "-preset", "medium", "-crf", "18", "-pix_fmt", "yuv420p", "-movflags", "+faststart")
@@ -398,17 +534,19 @@ func ffmpegArgs(o options, m info) []string {
 }
 
 func run(o options) error {
-	if !o.overwrite {
+	if !o.listTechniques && !o.overwrite {
 		if _, e := os.Stat(o.output); e == nil {
 			return fmt.Errorf("output already exists: %s (use --overwrite)", o.output)
 		}
 	}
-	abs, e := filepath.Abs(o.output)
-	if e != nil {
-		return e
+	if !o.listTechniques {
+		abs, e := filepath.Abs(o.output)
+		if e != nil {
+			return e
+		}
+		o.output = abs
 	}
-	o.output = abs
-	if o.format != "png" {
+	if !o.listTechniques && o.format != "png" {
 		if e := os.MkdirAll(filepath.Dir(o.output), 0755); e != nil {
 			return e
 		}
@@ -522,6 +660,28 @@ func run(o options) error {
 	if !loaded {
 		state, _ := c.evaluate(`JSON.stringify({ready:document.readyState,title:document.title,url:location.href,j:typeof J})`, false)
 		return fmt.Errorf("JIZURA frontend failed to initialize: last=%s state=%s Chromium: %.400s", lastEval, state, chromeLog.String())
+	}
+	if o.listTechniques {
+		v, err := c.evaluate(`Object.fromEntries(J.GROUP_KEYS.map(g => [g, J.order(g).filter(key => J.registry(g)[key] && !J.registry(g)[key].special).map(key => ({id:key, name:J.registry(g)[key].name}))]))`, false)
+		if err != nil {
+			return err
+		}
+		var catalog map[string][]struct {
+			ID   string `json:"id"`
+			Name string `json:"name"`
+		}
+		if err := json.Unmarshal(v, &catalog); err != nil {
+			return err
+		}
+		for _, group := range []string{"layout", "enter", "hold", "exit", "decor", "treat", "bg", "cam", "trans", "fx"} {
+			if o.techGroup != "" && o.techGroup != group {
+				continue
+			}
+			for _, entry := range catalog[group] {
+				fmt.Printf("%s\t%s\t%s\n", group, entry.ID, entry.Name)
+			}
+		}
+		return nil
 	}
 	expr := string(bridge) + "\n__jizuraInit(" + string(raw) + ")"
 	v, err := c.evaluate(expr, true)
